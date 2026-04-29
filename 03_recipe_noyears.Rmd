@@ -1,0 +1,171 @@
+---
+title: "03_recipe_noyears"
+author: "Kathryn James McGraw"
+date: "2026-04-29"
+output: html_document
+---
+
+## Goal
+Build a complete, reproducible workflow that could realistically be used to generate predictions in practice. You do not need to actually deploy to a live service unless you want to—but you must produce a **deployable artifact** (e.g., saved model + documented input schema + reproducible pipeline).
+
+```{r packages}
+# ACCRE environment
+# module load StdEnv/2023 StdEnvACCRE/2023 R/4.5.0
+
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(data.table)
+library(stringr)
+library(arrow)
+library(dplyr)
+library(vip)
+library(purrr)
+library(readr)
+library(recipes)
+library(xgboost)
+library(finetune)
+```
+
+```{r load data produced by file 01_Data_KJM}
+data_dir <- "/v5000/data/goldring_group/LPO7550/Sample"
+output_dir <- "/v5000/data/goldring_group/LPO7550/Results/SimAnnealResults"
+
+df <- read_parquet(
+  file.path(data_dir, "ExiterFullSample.parquet")
+) %>%
+  clean_names()
+```
+
+```{r mutating outcome}
+df <- df %>%
+  mutate(
+    returner = factor(
+      if_else(returner == 1, "Returner", "NotReturner"),
+      levels = c("NotReturner", "Returner")
+    )
+  )
+```
+
+## What to do
+
+### 2) Data and preprocessing pipeline (reproducible)
+Create a single workflow/pipeline that handles:
+- Train/test split (and CV on training set as needed)
+- Missing data strategy
+- Encoding for categoricals
+- Scaling/transformations (if needed)
+- Feature engineering (if used)
+- Leakage prevention (make sure no post-outcome features)
+
+Document:
+- Final feature list
+- Input schema (variable names, types, allowable ranges/categories)
+
+```{r recoding post-exit observations to prevent leakage}
+
+setDT(df) #convert to data.table for faster processing
+
+stems <- c(
+  "career_stage", "ed_exp", "move_org_count", "field", "degree",
+  "ed_field_transition", "mapped_role", "startdate_parsed", "enddate_effective",
+  "date_calc_valid_flag", "education_role", "teacher_role", "school_leader_soc_role",
+  "sch_lead_exp", "teaching_exp", "move_field", "move_field_count", "move_geo",
+  "move_geo_count", "move_org", "role_length", "yrs_obs", "move_field_flag",
+  "move_geo_flag", "move_org_flag", "role_field", "leader_role_label", "ever_role2_4",
+  "start_salary", "additional_compensation", "total_compensation", "end_salary",
+  "salary", "location_raw", "metro_area", "city", "country", "msa",
+  "position_number", "region", "seniority", "state", "company_cleaned",
+  "title_translated", "soc_cleaned", "company_cleaned_is_ed_org_match",
+  "role_field_label"
+)
+
+pattern <- paste0("^(", paste(stems, collapse = "|"), ")_\\d+$")
+
+target_cols <- names(df)[stringr::str_detect(names(df), pattern)]
+
+for (col in target_cols) {
+  col_num <- as.integer(str_extract(col, "\\d+$"))
+  df[!is.na(exit_index) & exit_index < col_num, (col) := NA]
+}
+
+df <- as_tibble(df) #convert back for tidyverse below
+```
+
+```{r input schema}
+
+input_schema <- df %>%
+  summarise(across(everything(), list), .groups = "drop") %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "values") %>%
+  mutate(
+    type = map_chr(values, ~ class(.x)[1]),
+    n_unique = map_int(values, ~ dplyr::n_distinct(.x, na.rm = TRUE)),
+    min = map_dbl(values, ~ if (is.numeric(.x)) min(.x, na.rm = TRUE) else NA_real_),
+    max = map_dbl(values, ~ if (is.numeric(.x)) max(.x, na.rm = TRUE) else NA_real_),
+    example_values = map_chr(
+      values,
+      ~ {
+        vals <- unique(.x)
+        vals <- vals[!is.na(vals)]
+        paste(head(vals, 5), collapse = ", ")
+      }
+    )
+  ) %>%
+  select(variable, type, n_unique, min, max, example_values)
+
+write_csv(
+  input_schema,
+  file.path(output_dir, "input_schema.csv")
+)
+```
+
+```{r split}
+set.seed(123) #seed for reproducibility
+
+df_split <- initial_split(df)
+
+train_cal <- training(df_split)
+test  <- testing(df_split)
+
+# Further split training into proper train (75%) and calibration (25%)
+cal_split <- initial_split(train_cal, prop = 0.75)
+cal_train  <- training(cal_split)
+cal_test   <- testing(cal_split)
+```
+
+```{r recipe}
+formula <- as.formula("returner ~ .")
+
+xgb_recipe_noexityear <- recipe(formula, cal_train) %>%
+  update_role(user_id, new_role = "id") %>%
+  update_role(returner, new_role = "outcome") %>%
+  step_date(all_date_predictors(), features = c("year")) %>%
+  step_rm(starts_with("position_id")) %>% #meaningless; removing numeric IDs assigned to each position when data were at position-level
+  step_rm(all_date_predictors()) %>%
+  step_rm(ever_entrant) %>% #ever_entrant contains the outcome, as it flagged moving from non-ed role back to ed as an entrance; removing to prevent leakage
+  step_rm(post_exit_transition) %>% #omitting count of career transitions post-exit
+  step_rm(year_of_exit) %>% #omitting year of exit from education to test for fairness
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors(), new_level = ".missing") %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>% #repeating because continuing to get "following columns have zero variance so scaling cannot be used" error message after the reordering we discussed
+  step_normalize(all_numeric_predictors())
+```
+
+```{r final feature list}
+xgb_prep_noexityear <- prep(xgb_recipe_noexityear, training = cal_train)
+
+final_features_noexityear <- juice(xgb_prep_noexityear)
+
+feature_list_noexityear <- tibble(
+  feature_name = names(final_features_noexityear),
+  type = map_chr(final_features_noexityear, ~ class(.x)[1])
+)
+
+write_csv(
+  feature_list_noexityear,
+  file.path(output_dir, "final_features_noexityear_list.csv")
+)
+```

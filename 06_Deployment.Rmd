@@ -1,0 +1,64 @@
+---
+title: "06_Deployment"
+author: "Kathryn James McGraw"
+date: "2026-04-22"
+output: html_document
+---
+
+This deployment script was generated with *lots* of help from Google and ChatGPT. 
+
+To deploy the model, the user must have LinkedIn data (or appropriately formatted resume data) and have already generated intermediate variables, like binary flags for whether or not a role was in teaching or school leadership specifically or education overall. Depending on the data source the user has, file 01 (data wrangling) may be needed to reshape long position- and education event-level data to worker-level data. If the user's data are already worker-level, file 01 may be unnecessary. Once data are worker-level, the model can be deployed using the below script.
+
+```{r loading packages}
+library(tidymodels)
+library(readr)
+library(dplyr)
+library(janitor)
+```
+
+```{r paths}
+input_dir <- "PATH"
+output_dir <- "PATH"
+```
+
+```{r function for predictions}
+predict_xgb_model <- function(
+  model_path,
+  new_data,
+  output_path = NULL
+) {
+  
+  # 1) Load model
+  model <- readRDS(model_path)
+  
+  # 2) Basic schema alignment
+  new_data <- new_data %>%
+    clean_names()
+  
+  # 3) Generate predictions
+  preds_class <- predict(model, new_data, type = "class")
+  preds_prob  <- predict(model, new_data, type = "prob")
+  
+  # 4) Combine outputs
+  results <- new_data %>%
+    select(user_id) %>% #if using data without numeric user IDs, delete this line.
+    bind_cols(preds_class, preds_prob)
+    
+  # 5) Save to CSV
+  if (!is.null(output_path)) {
+    write_csv(results, output_path)
+  }
+  
+  return(results)
+}
+```
+
+```{r generating predictions}
+df_new <- arrow::read_parquet(file.path(input_dir, "FILE_NAME.parquet"))
+
+preds <- predict_xgb_model(
+  model_path = file.path(input_dir, "xgb_final_workflow.rds"),
+  new_data = df_new,
+  output_path = file.path(output_dir, "new_predictions.csv")
+)
+```

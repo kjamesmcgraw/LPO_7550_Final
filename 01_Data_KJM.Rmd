@@ -1,0 +1,517 @@
+---
+title: "01: LPO 7550 Returner Analysis Sample Construction"
+author: "Kathryn James McGraw"
+date: "2026-04-19"
+output: html_document
+---
+
+# Base File 1: Building person-level dataset of ever-exiter school leaders, including time-invariant user data, position histories, and education histories. The goal is to predict which of these ever-exiters return to K-12 education at any point after exiting.
+
+```{r packages}
+library(tidyverse)
+library(arrow)
+library(data.table)
+library(lubridate)
+library(scales)
+library(broom)
+library(glue)
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(tibble)
+```
+
+```{r paths}
+data_dir <- "/v5000/data/goldring_group/SampleFiles/Leader/0331"
+leader_sample_dir <- file.path(data_dir, "Leader_Sample_raw_")
+education_dir <- "/v5000/data/goldring_group/revelio_individual_user_education_us/"
+user_dir <- "/v5000/data/goldring_group/revelio_individual_user_us/"
+output_dir <- "/v5000/data/goldring_group/LPO7550/Sample"
+
+sample_files <- sort(list.files(
+  path = leader_sample_dir,
+  pattern = "^Leader_Sample_raw__part_[0-9]{4}\\.parquet$",
+  full.names = TRUE
+))
+
+education_files <- sort(list.files(
+  path = education_dir,
+pattern = "^individual_user_education_us__\\d+_\\d+_\\d+\\.parquet$",
+full.names = TRUE
+))
+
+user_files <- sort(list.files(
+  path = user_dir,
+pattern = "^individual_user_us__\\d+_\\d+_\\d+\\.parquet$",
+full.names = TRUE
+))
+```
+
+```{r helpers and functions}
+role_field_labels <- c(
+  "11" = "Management Occupations",
+  "13" = "Business and Financial Operations Occupations",
+  "15" = "Computer and Mathematical Occupations",
+  "17" = "Architecture and Engineering Occupations",
+  "19" = "Life, Physical, and Social Science Occupations",
+  "21" = "Community and Social Service Occupations",
+  "23" = "Legal Occupations",
+  "25" = "Educational Instruction and Library Occupations",
+  "27" = "Arts, Design, Entertainment, Sports, and Media Occupations",
+  "29" = "Healthcare Practitioners and Technical Occupations",
+  "31" = "Healthcare Support Occupations",
+  "33" = "Protective Service Occupations",
+  "35" = "Food Preparation and Serving Related Occupations",
+  "37" = "Building and Grounds Cleaning and Maintenance Occupations",
+  "39" = "Personal Care and Service Occupations",
+  "41" = "Sales and Related Occupations",
+  "43" = "Office and Administrative Support Occupations",
+  "45" = "Farming, Fishing, and Forestry Occupations",
+  "47" = "Construction and Extraction Occupations",
+  "49" = "Installation, Maintenance, and Repair Occupations",
+  "51" = "Production Occupations",
+  "53" = "Transportation and Material Moving Occupations",
+  "55" = "Military Specific Occupations"
+)
+
+label_role_field <- function(x) {
+  out <- unname(role_field_labels[as.character(as.integer(x))])
+  out[is.na(out) & !is.na(x)] <- paste0("Field ", as.integer(x[is.na(out) & !is.na(x)]))
+  out
+}
+
+# Function to pull all variables of one type from wide the data into one vector
+extract_wide_values <- function(data, prefix) {
+  data %>%
+    select(matches(paste0("^", prefix, "_[0-9]+$"))) %>%
+    pivot_longer(
+      cols = everything(),
+      names_to = "source_col",
+      values_to = "value"
+    ) %>%
+    pull(value)
+}
+
+# Function to count position_ids after wide
+count_unique_wide <- function(data, prefix) {
+  vals <- extract_wide_values(data, prefix) %>%
+    as.character() %>%
+    trimws()
+  vals <- vals[!is.na(vals) & vals != ""]
+  length(unique(vals))
+}
+
+# Function to tally date missingness after wide
+count_value_wide <- function(data, prefix, target) {
+  vals <- extract_wide_values(data, prefix)
+
+  sum(vals %in% target, na.rm = TRUE)
+}
+
+# Function to count returners (and verify exiters) after wide
+count_users_any_wide <- function(data, prefix, target) {
+  wide_cols <- data %>%
+    select(user_id, matches(paste0("^", prefix, "_[0-9]+$")))
+
+  wide_cols %>%
+    mutate(
+      any_match = if_any(
+        -user_id,
+        ~ .x %in% target
+      )
+    ) %>%
+    summarise(n = sum(any_match, na.rm = TRUE)) %>%
+    pull(n)
+}
+```
+
+```{r read position data}
+read_pos_cols <- c(
+  "user_id", "position_id", "mapped_role",
+  "startdate_parsed", "enddate_effective", "date_calc_valid_flag",
+  "Education_role", "Teacher_role", "School_leader_soc_role",
+  "EverEntrant", "EverExiter", "Returner", "Ed_Exp", 
+  "SchLead_Exp", "Teaching_Exp", "move_field", "move_field_count", "move_geo", 
+  "move_geo_count", "move_org", "move_org_count", "role_length", "yrs_obs", 
+  "Ed_Field_Transition", "move_field_flag", "move_geo_flag", "move_org_flag",
+  "Role_Field", "Leader_Role_Label", "EverRole2_4", "start_salary", 
+  "additional_compensation", "total_compensation", "end_salary", "salary", 
+  "location_raw", "Metro_area", "city", "country", "msa", "position_number", 
+  "region", "seniority", "state", "company_cleaned", 
+  "title_translated", "soc_cleaned", "company_cleaned_is_ed_org_match", 
+  "company_cleaned_match_trigger", "open_ended_role_flag", 
+  "overlap_capped_flag"
+)
+
+full_files <- open_dataset(
+  sample_files,
+  format = "parquet"
+)
+
+dt <- full_files %>%
+  select(any_of(read_pos_cols)) %>% #read in only selected variables
+  filter(EverExiter %in% c(1, TRUE)) %>% #read in only ever-exiters
+  collect() %>%
+  as.data.table()
+
+dt[, user_id := as.character(user_id)]
+dt[, position_id := as.character(position_id)]
+dt[, Leader_Role_Label := trimws(as.character(Leader_Role_Label))]
+dt[Leader_Role_Label == "", Leader_Role_Label := NA_character_]
+dt[, Role_Field_Label := label_role_field(Role_Field)]
+
+```
+
+
+```{r}
+#generate position-specific career stage variable
+dt <- dt %>% mutate(
+    career_stage = case_when(
+      is.na(yrs_obs) ~ NA_character_,
+      yrs_obs < 5 ~ "Early career",
+      yrs_obs < 15 ~ "Mid career",
+      yrs_obs >= 15 ~ "Late career"
+    ),
+    career_stage = factor(career_stage, levels = c("Early career", "Mid career", "Late career"))
+  )
+
+#dropping leaders with impossible position data (>= 50 unique position_id values)
+drop_audit <- dt[
+  !is.na(position_id),
+  .(n_positions = uniqueN(position_id)),
+  by = user_id
+][n_positions >= 50]
+
+#reporting on observations to be dropped below
+fwrite(drop_audit, file.path(output_dir, "dropped_high_position_users.csv"))
+
+dt <- dt[!user_id %in% drop_audit$user_id]
+```
+
+```{r long to wide reshape}
+setorder(dt, user_id, startdate_parsed, enddate_effective, position_id)
+dt[, position_seq := seq_len(.N), by = user_id]
+
+#defining the reshape
+position_vars <- setdiff(names(dt), c("user_id"))
+position_vars <- setdiff(position_vars, "position_seq")
+
+dt_wide <- dcast(
+  dt,
+  user_id ~ position_seq,
+  value.var = position_vars
+)
+```
+
+```{r}
+#saving EverExiter user IDs for merges below
+keep_user_ids <- unique(dt$user_id)
+keep_users_dt <- data.table(user_id = keep_user_ids)
+keep_users_tbl <- tibble(
+  user_id = as.character(keep_users_dt$user_id)
+)
+```
+
+```{r education data}
+read_ed_cols <- c(
+  "user_id", "university_name", "education_number", "degree", "field", 
+  "startdate", "enddate"
+)
+
+education_ds <- open_dataset(
+  education_files,
+  format = "parquet"
+)
+
+#checking education_ds 
+colnames_df_ed <- tibble(
+  column_name = colnames(education_ds)
+)
+write_csv(
+  colnames_df_ed,
+  file.path(output_dir, "education_dataset_column_names.csv")
+)
+
+#reading in relevant rows
+ed_dt <- education_ds %>%
+  select(all_of(read_ed_cols)) %>%
+  mutate(user_id = as.character(user_id)) %>%
+  semi_join(keep_users_tbl, by = "user_id") %>%
+  collect() %>%
+  as.data.table()
+
+ed_dt[, user_id := as.character(user_id)]
+
+#ordering for reshape
+setorder(ed_dt, user_id, education_number, startdate, enddate)
+ed_dt[, education_seq := seq_len(.N), by = user_id]
+
+#defining the reshape
+education_vars <- setdiff(names(ed_dt), c("user_id"))
+education_vars <- setdiff(education_vars, "education_seq")
+
+#reshaping long ed data to wide at user level
+ed_wide <- dcast(
+  ed_dt,
+  user_id ~ education_seq,
+  value.var = education_vars
+)
+```
+
+```{r user data}
+read_user_cols <- c(
+  "user_id", "firstname", "lastname", "prestige", "highest_degree", 
+  "numconnections", "updated_dt"
+)
+
+user_ds <- open_dataset(
+  user_files,
+  format = "parquet"
+)
+
+#checking user_ds 
+colnames_df_user <- tibble(
+  column_name = colnames(user_ds)
+)
+write_csv(
+  colnames_df_user,
+  file.path(output_dir, "user_dataset_column_names.csv")
+)
+
+user_dt <- user_ds %>%
+  select(all_of(read_user_cols)) %>%
+  mutate(user_id = as.character(user_id)) %>%
+  semi_join(keep_users_tbl, by = "user_id") %>%
+  collect() %>%
+  as.data.table()
+
+user_dt[, user_id := as.character(user_id)]
+```
+
+```{r merging}
+analytic_dt <- merge(
+  dt_wide,
+  ed_wide,
+  by = "user_id",
+  all.x = TRUE
+)
+
+analytic_dt <- merge(
+  analytic_dt,
+  user_dt,
+  by = "user_id",
+  all.x = TRUE
+)
+```
+
+```{r collapsing reshaped data for non-varying variables}
+
+#pattern generated in reshape 
+suffixed_cols <- names(analytic_dt)[str_detect(names(analytic_dt), "_\\d+$")]
+
+suffix_lookup <- tibble(
+  col = suffixed_cols,
+  stem = str_remove(suffixed_cols, "_\\d+$"),
+  suffix_num = as.integer(str_extract(suffixed_cols, "\\d+$"))
+) %>%
+  arrange(stem, suffix_num)
+
+stems_to_check <- suffix_lookup %>%
+  count(stem, name = "n_cols") %>%
+  filter(n_cols > 1) %>%
+  pull(stem)
+
+#holders as variable sets are checked
+collapsed_stems <- c()
+skipped_stems <- c()
+
+row_matches_strict_pattern <- function(x) {
+   if (all(is.na(x))) {
+    return(TRUE)
+  } # all missing collapses 
+
+  if (is.na(x[1])) {
+    return(FALSE)
+  }   # _1 must be observed if any value is observed
+
+  last_non_missing <- max(which(!is.na(x)))   # Find last non-missing value
+
+  if (any(is.na(x[1:last_non_missing]))) {
+    return(FALSE)
+  }  # All values up to last non-missing must be observed
+
+  if (!all(x[1:last_non_missing] == x[1])) {
+    return(FALSE)
+  }   # All observed values must match _1
+
+  TRUE
+}   # Anything after last observed can be missing and is ignored
+
+for (this_stem in stems_to_check) {
+
+  stem_cols <- suffix_lookup %>%
+    filter(stem == this_stem) %>%
+    arrange(suffix_num) %>%
+    pull(col)
+
+  stem_matrix <- analytic_dt[, ..stem_cols]
+
+  row_ok <- apply(
+    stem_matrix,
+    1,
+    row_matches_strict_pattern
+  )
+
+  if (all(row_ok)) {
+
+    keep_col <- paste0(this_stem, "_1")
+
+    analytic_dt <- analytic_dt %>%
+      mutate(!!this_stem := .data[[keep_col]]) %>%
+      select(-all_of(stem_cols))
+
+    collapsed_stems <- c(collapsed_stems, this_stem)
+
+  } else {
+    skipped_stems <- c(skipped_stems, this_stem)
+  }
+}
+
+#reporting
+collapsed_summary <- tibble(collapsed_stem = collapsed_stems)
+skipped_summary <- tibble(skipped_stem = skipped_stems)
+
+message("Collapsed stems: ", paste(collapsed_stems, collapse = ", "))
+message("Skipped stems with conflicting within-row values: ", paste(skipped_stems, collapse = ", "))
+```
+
+```{r generating predictors for use in exiter-only analysis}
+#predictors based on value at time of exit from education
+analytic_dt <- analytic_dt %>%
+  rowwise() %>%
+  mutate(
+    exit_index = {
+      exit_vals <- c_across(matches("^ed_field_transition_\\d+$"))
+      exit_pos <- which(exit_vals == 1)
+      if (length(exit_pos) == 0) NA_integer_ else exit_pos[1]
+    },
+    post_exit_transition = {
+      if (is.na(exit_index)) {
+        NA_integer_
+      } else {
+        pos_vals <- c_across(matches("^position_id_\\d+$"))
+        sum(!is.na(pos_vals) & seq_along(pos_vals) > exit_index)
+      }
+    },
+    entrant_pre_exit = {
+      if (is.na(exit_index)) {
+        NA_integer_
+      } else if (exit_index <= 1) {
+        0L
+      } else {
+        vals <- c_across(matches("^ed_field_transition_\\d+$"))
+        as.integer(any(vals[1:(exit_index - 1)] == 2, na.rm = TRUE))
+      }
+    }, #must separately flag entrances BEFORE the initial exit, as all post-exit returns are flagged as position-level entrances (making the ever-entrant flag 1 for ALL returners, regardless of pre-education path)
+    career_stage_at_exit = {
+      if (is.na(exit_index)) {
+        NA_character_
+      } else {
+        vals <- c_across(matches("^career_stage_\\d+$"))
+        as.character(vals[exit_index])
+      }
+    },
+    ed_exp_at_exit = {
+      if (is.na(exit_index)) {
+        NA_real_
+      } else {
+        vals <- c_across(matches("^ed_exp_\\d+$"))
+        as.numeric(vals[exit_index])
+      }
+    },
+   move_org_count_at_exit = {
+      if (is.na(exit_index)) {
+        NA_real_
+      } else {
+        vals <- c_across(matches("^move_org_count_\\d+$"))
+        as.numeric(vals[exit_index])
+      }
+    },
+    year_of_exit = {
+      if (is.na(exit_index)) {
+        NA_integer_
+      } else {
+        vals <- c_across(matches("^enddate_effective_\\d+$"))
+        end_val <- vals[exit_index]
+        if (is.na(end_val)) {
+          NA_integer_
+        } else {
+          lubridate::year(as.Date(end_val))
+        }
+      }
+    }
+  ) %>%
+  ungroup()
+
+#BA in Education flag
+analytic_dt <- analytic_dt %>%
+  mutate(
+    education_ba = if_else(
+      if_any(matches("^field_\\d+$"), ~ !is.na(.) & stringr::str_to_lower(trimws(as.character(.))) == "education"),
+      "Education BA",
+      "Not education BA"
+    ),
+    education_ba = factor(
+      education_ba,
+      levels = c("Not education BA", "Education BA")
+    )
+  )
+
+analytic_dt %>%
+  count(education_ba)
+```
+
+```{r summarize}
+analytic_summary <- tibble(
+  metric = c(
+    "Number of unique user_id values in analytic_dt",
+    "Validation: Number of Exiters in analytic_dt",
+    "Number of user_ids in analytic_dt for whom Returner == 1",
+    "Number of unique position_id values in analytic_dt",
+    "Number of position_ids for which date_calc_valid_flag == 1",
+    "Number of position_ids for which date_calc_valid_flag == 0"
+  ),
+  value = c(
+    n_distinct(analytic_dt$user_id, na.rm = TRUE),
+    count_users_any_wide(analytic_dt, "EverExiter", c(1, TRUE, "1", "TRUE")),
+    count_users_any_wide(analytic_dt, "Returner", c(1, TRUE, "1", "TRUE")),
+    count_unique_wide(analytic_dt, "position_id"),
+    count_value_wide(analytic_dt, "date_calc_valid_flag", c(1, TRUE, "1", "TRUE")),
+    count_value_wide(analytic_dt, "date_calc_valid_flag", c(0, FALSE, "0", "FALSE"))
+  )
+)
+
+analytic_summary
+```
+
+```{r save}
+#save sample summary
+write_csv(
+  analytic_summary,
+  file.path(output_dir, "ExiterFullSample_summary_counts.csv")
+)
+
+#save list of variable names
+tibble(column_audit = names(analytic_dt)) %>%
+  write_csv(file.path(output_dir, "sample_column_audit.csv"))
+
+#save cleaned dataset
+output_file <- file.path(output_dir, "ExiterFullSample.parquet")
+
+write_parquet(
+  analytic_dt,
+  sink = output_file,
+  compression = "snappy"   # fast + widely supported
+)
+```

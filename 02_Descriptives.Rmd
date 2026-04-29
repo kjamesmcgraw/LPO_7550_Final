@@ -1,0 +1,383 @@
+---
+title: "02: LPO 7550 Returner Analysis Sample Descriptives + Data Exploration"
+author: "Kathryn James McGraw"
+date: "2026-04-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(tidyverse)
+library(janitor)
+library(arrow)
+library(broom)
+library(scales)
+```
+
+```{r load data produced by file 01_Data_KJM}
+data_dir <- "/v5000/data/goldring_group/LPO7550/Sample"
+output_dir <- "/v5000/data/goldring_group/LPO7550/Results"
+
+df <- read_parquet(
+  file.path(data_dir, "ExiterFullSample.parquet")
+) %>%
+  clean_names()
+```
+
+```{r helpers and functions}
+
+categorical_summary <- function(data, var) {
+  data %>%
+    filter(!is.na({{ var }}), !is.na(returner)) %>%
+    group_by({{ var }}) %>%
+    summarise(
+      n = n(),
+      n_returners = sum(returner),
+      return_rate = mean(returner),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(return_rate))
+}
+
+binned_summary <- function(data, var, bins = 5) {
+  data %>%
+    filter(!is.na({{ var }}), !is.na(returner)) %>%
+    mutate(bin = ntile({{ var }}, bins)) %>%
+    group_by(bin) %>%
+    summarise(
+      bin_min = min({{ var }}, na.rm = TRUE),
+      bin_max = max({{ var }}, na.rm = TRUE),
+      n = n(),
+      n_returners = sum(returner),
+      return_rate = mean(returner),
+      .groups = "drop"
+    ) %>%
+    mutate(bin_label = paste0("Q", bin, ": ", round(bin_min, 1), " to ", round(bin_max, 1)))
+}
+```
+
+## Goal
+Describe your **outcome (dependent variable)** and show how it varies with several **independent variables** using both **tabular and graphical** analysis. Use techniques like **conditional means**, **correlations**, and **simple regression** to quantify relationships.
+
+### 1) Describe the outcome variable
+
+```{r describing returner variable}
+#outcome in context
+outcome_counts <- df %>%
+  summarise(
+    exiter_n = n(),
+    post_exit_transition_position_count = sum(post_exit_transition, na.rm = TRUE),
+    users_with_post_exit_transition = sum(post_exit_transition > 0, na.rm = TRUE),
+    returner_n = sum(returner, na.rm = TRUE)
+  ) %>%
+  as.list()
+
+outcome_counts
+
+outcome_dist <- df %>%
+  mutate(returner_label = if_else(returner == 1, "Returned to K-12", "Did not return")) %>%
+  count(returner_label) %>%
+  mutate(prop = n / sum(n))
+
+outcome_dist
+
+plot_outcome <- outcome_dist %>%
+  ggplot(aes(x = returner_label, y = prop, fill = returner_label)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = percent(prop, accuracy = 0.1)), vjust = -0.3) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Distribution of Returner Outcome",
+    x = NULL,
+    y = "Share of exiters"
+  ) +
+  theme_minimal(base_size = 12)
+
+plot_outcome
+```
+
+The outcome variable is "Returner," a binary indicator of whether or not a school leader who exits the K-12 education field later returns to it. This measure focuses only on school leaders, defined as principals, APs, and "teacher plus" school-level leadership roles. 
+
+75,939 ever-leaders are exiters (the analytic sample). Of these exiters, I observe a post-exit career transition for 26,783 individuals. 11,262 of these exiters with post-exit transitions later return to K-12 education (the outcome of interest).
+
+### 2) Choose several predictors to examine
+
+```{r mutating to create meaningful bins for continuous variables for description below}
+df <- df %>%
+  mutate(
+    move_org_count_at_exit_bin = case_when(
+      is.na(move_org_count_at_exit) ~ NA_character_,
+      move_org_count_at_exit == 0 ~ "0",
+      move_org_count_at_exit == 1 ~ "1",
+      move_org_count_at_exit == 2 ~ "2",
+      move_org_count_at_exit >= 3 ~ "3+"
+    ),
+    move_org_count_at_exit_bin = factor(
+      move_org_count_at_exit_bin,
+      levels = c("0", "1", "2", "3+")
+    ),
+    ed_exp_at_exit_bin = case_when(
+      is.na(ed_exp_at_exit) ~ NA_character_,
+      ed_exp_at_exit < 1 ~ "<1",
+      ed_exp_at_exit < 3 ~ "1 to <3",
+      ed_exp_at_exit < 5 ~ "3 to <5",
+      ed_exp_at_exit < 10 ~ "5 to <10",
+      ed_exp_at_exit >= 10 ~ "10+"
+    ),
+    ed_exp_at_exit_bin = factor(
+      ed_exp_at_exit_bin,
+      levels = c("<1", "1 to <3", "3 to <5", "5 to <10", "10+")
+    )
+  )
+```
+
+```{r describing predictors}
+
+# Career stage at exit
+df %>%
+  count(career_stage_at_exit, name = "n") %>%
+  mutate(proportion = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Education BA
+df %>%
+  count(education_ba, name = "n") %>%
+  mutate(proportion = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Entrant before exit
+df %>%
+  count(entrant_pre_exit, name = "n") %>%
+  mutate(proportion = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Years of education experience at exit
+df %>%
+  summarize(mean(ed_exp_at_exit), sd(ed_exp_at_exit), min(ed_exp_at_exit), max(ed_exp_at_exit))
+
+df %>%
+  filter(!is.na(ed_exp_at_exit_bin)) %>%
+  count(ed_exp_at_exit_bin, name = "n") %>%
+  mutate(proportion = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Number of organizational moves at exit
+df %>%
+  summarize(mean(move_org_count_at_exit), sd(move_org_count_at_exit), min(move_org_count_at_exit), max(move_org_count_at_exit))
+
+df %>%
+  filter(!is.na(move_org_count_at_exit_bin)) %>%
+  count(move_org_count_at_exit_bin, name = "n") %>%
+  mutate(proportion = n / sum(n)) %>%
+  arrange(desc(n))
+```
+
+The values for years of experience in education prior to exit are improbable and point to the need for greater cleaning that I discussed at PEP; 35% of exiters are coded as having less than one year of education experience, with the average being 2.7 years (sd=3.7).
+
+
+### 3) Tabular analysis: conditional summaries
+Use tables to summarize the outcome **conditional on predictor values**.
+- For **categorical predictors**:
+  - Table of **mean outcome by category** (or % outcome=1 for binary outcomes), plus **N** per group
+  - Optionally include standard errors or confidence intervals if you know how
+- For **continuous predictors**:
+  - Create **binned summaries** (e.g., quintiles/deciles) and report mean outcome by bin
+
+```{r conditional summaries}
+tab_career_stage <- categorical_summary(df, career_stage_at_exit)
+tab_entrant_pre_exit <- categorical_summary(df, entrant_pre_exit)
+tab_edu_ba <- categorical_summary(df, education_ba)
+tab_ed_exp <- categorical_summary(df, ed_exp_at_exit_bin)
+tab_move_org <- categorical_summary(df, move_org_count_at_exit_bin)
+
+tab_career_stage
+readr::write_csv(
+  tab_career_stage,
+  file.path(output_dir, "tab_career_stage.csv")
+)
+
+tab_entrant_pre_exit
+readr::write_csv(
+  tab_entrant_pre_exit,
+  file.path(output_dir, "tab_entrant_pre_exit.csv")
+)
+
+tab_edu_ba
+readr::write_csv(
+  tab_edu_ba,
+  file.path(output_dir, "tab_edu_ba.csv")
+)
+
+tab_ed_exp
+readr::write_csv(
+  tab_ed_exp,
+  file.path(output_dir, "tab_ed_exp.csv")
+)
+
+tab_move_org
+readr::write_csv(
+  tab_move_org,
+  file.path(output_dir, "tab_move_org.csv")
+)
+```
+
+### 4) Graphical analysis
+Include **at least 3–5 figures** that directly answer “how does Y change with X?”
+Examples:
+- Scatterplots (with smoothing line) for outcome vs continuous predictor
+- Binned means plot (mean outcome by predictor bin)
+- If outcome is binary: plots of predicted probability from a simple logistic regression vs X
+
+```{r ploting returner wrt predictors}
+# Figure 2: mean return rate by career stage
+p2 <- tab_career_stage %>%
+  ggplot(aes(x = career_stage_at_exit, y = return_rate, fill = career_stage_at_exit)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0("N = ", comma(n))), vjust = -0.6, size = 3.5) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Return-to-K-12 Rate by Career Stage",
+    x = NULL,
+    y = "Return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p2
+
+# Figure 2a: mean return rate by pre-exit entry
+p2a <- tab_entrant_pre_exit %>%
+  ggplot(aes(x = entrant_pre_exit, y = return_rate, fill = entrant_pre_exit)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0("N = ", comma(n))), vjust = -0.6, size = 3.5) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Return-to-K-12 Rate by Pre-Exit Entry to Education",
+    x = NULL,
+    y = "Return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p2a
+
+# Figure 3: binned means for education experience
+p3 <- tab_ed_exp %>%
+  ggplot(aes(x = ed_exp_at_exit_bin, y = return_rate, fill = ed_exp_at_exit_bin)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0("N = ", comma(n))), vjust = -0.6, size = 3.5) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Return-to-K-12 Rate by Education Experience at Exit",
+    x = NULL,
+    y = "Return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p3
+
+# Figure 4: simple logistic fit for returner vs education experience
+m_edexp <- glm(returner ~ poly(ed_exp_at_exit, 2, raw = TRUE),
+               data = df,
+               family = binomial())
+
+ed_grid <- tibble(
+  ed_exp_at_exit = seq(min(df$ed_exp_at_exit, na.rm = TRUE),
+               max(df$ed_exp_at_exit, na.rm = TRUE),
+               length.out = 200)
+) %>%
+  mutate(pred = predict(m_edexp, newdata = ., type = "response"))
+
+p4 <- ggplot(df, aes(x = ed_exp_at_exit, y = as.numeric(returner))) +
+  geom_jitter(height = 0.03, width = 0, alpha = 0.15) +
+  geom_line(data = ed_grid, aes(x = ed_exp_at_exit, y = pred), color = "steelblue", linewidth = 1.1) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Predicted Probability of Return by Education Experience",
+    x = "Years of education experience at exit",
+    y = "Predicted probability of return"
+  ) +
+  theme_minimal(base_size = 12)
+
+p4
+
+# Figure 5: binned means for prior organizational moves
+p5 <- tab_move_org %>%
+  ggplot(aes(x = move_org_count_at_exit_bin, y = return_rate, fill = move_org_count_at_exit_bin)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0("N = ", comma(n))), vjust = -0.6, size = 3.5) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title = "Return-to-K-12 Rate by Org Moves at Exit",
+    x = NULL,
+    y = "Return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p5
+```
+
+### 5) Quantify relationships
+Use at least one of the following:
+- **Simple regressions** (outcome on one predictor at a time) to get an interpretable slope
+- **Multiple logistic regression** (outcome on several predictors) as a descriptive model (not a final ML model)
+
+Be explicit about what each statistic is telling you, and avoid causal language.
+
+```{r regressing returner on predictor(s)}
+# Simple one-predictor logistic regressions
+#measures with larger conditional mean differences 
+m1 <- glm(returner ~ factor(education_ba), data = df, family = binomial())
+m2 <- glm(returner ~ factor(career_stage_at_exit), data = df, family = binomial())
+
+m3 <- glm(returner ~ ed_exp_at_exit, data = df, family = binomial())
+m4 <- glm(returner ~ factor(ed_exp_at_exit_bin), data = df, family = binomial())
+
+#boundarylessness measures
+m5 <- glm(returner ~ move_org_count_at_exit, data = df, family = binomial())
+m6 <- glm(returner ~ factor(move_org_count_at_exit_bin), data = df, family = binomial())
+
+m7 <- glm(returner ~ factor(entrant_pre_exit), data = df, family = binomial())
+
+
+tidy(m1, exponentiate = TRUE, conf.int = TRUE)
+tidy(m2, exponentiate = TRUE, conf.int = TRUE)
+tidy(m3, exponentiate = TRUE, conf.int = TRUE)
+tidy(m4, exponentiate = TRUE, conf.int = TRUE)
+tidy(m5, exponentiate = TRUE, conf.int = TRUE)
+tidy(m6, exponentiate = TRUE, conf.int = TRUE)
+tidy(m7, exponentiate = TRUE, conf.int = TRUE)
+
+# Descriptive multiple logistic model
+model_data <- df %>%
+    select(returner, ed_exp_at_exit, move_org_count_at_exit, entrant_pre_exit, education_ba, career_stage_at_exit) %>%
+    drop_na()
+
+  m_multi <- glm(
+    returner ~ ed_exp_at_exit + move_org_count_at_exit + factor(entrant_pre_exit) + factor(education_ba) + factor(career_stage_at_exit),
+    data = model_data,
+    family = binomial()
+  )
+
+multi_results <- tidy(m_multi, exponentiate = TRUE, conf.int = TRUE)
+multi_results
+
+#Model fit summary
+glance(m_multi)
+```
+
+### 6) Short written interpretation
+15% of exiters return to K-12 education (11,262 returners and 64,677 non-returners). While this is not a balanced sample, returning is not an excessively rare outcome.
+
+As summarized in tables and bar plots, holding an education degree, exiting education in early career, and not moving organizations prior to exiting education appear most related to exiters returning to education. Exiters with an education degree return at higher rates than exiters with a non-education degree (21% versus 14%). The simple logistic regression affirms this; holding an education degree relative to a non-education degree is associated with higher odds of returning (OR = 1.64, p < .001).
+
+Exiting education in late career is associated with a markedly lower rate of returning (condition mean return rate is 7% compared to 19% and 13% for early and mid-career, respectively). Predictably, the odds ratio for returning associated with a mid-career exit, relative to early-career exit,  is 0.33 (p < .001); somewhat surprisingly, the odds ratio associated with a late-career exit relative to early career is 0.62 (p < .001). While I hypothesized that individuals may return to gain/increase retirement benefits, this does not pan out in the data. 
+
+Relatedly, exiters with 10+ years of education experience have the lowest rate of returning (12%), though this is by far the smallest education experience class (n=421). Across the other education experience classes (ranging in size from n=1075-4411), rates of returning vary from 13-17%. A simple logistic regression taking education experience at exit as a continuous variable finds that each additional year of education experience was associated with lower odds of returning (OR = 0.97, p < .001).
+
+Somewhat surprisingly, variables relating to boundarylessness (move_count, entrant_pre_exit) are not clearly associated with returning; 16% of pre-exit entrants return compared to 14% of exiters for whom education was their first field. Exiters with 0 organization moves pre-exit have the highest rate of returning (20%), followed by exiters with 3+ organization moves pre-exit (15%, though there are only 177 such individuals). Exiters with 1 organization move pre-exit (n=3726) have the lowest rate of returning (10%). A simple logistic regression taking the number of organizational moves pre-exit as a continuous variable finds that each additional move was associated with lower odds of returning (OR = 0.65, p < .001); while the exact odds ratio per organization move category varied, all categories were associated with lower odds of returning relative to the 0 moves pre-exit category. Surprisingly, despite the conditional mean difference between pre-exit entrants and first-career educators appearing small (2 percentage points), being a pre-exit entrant relative to a first-career educator is associated with statistically significant higher odds of returning (OR=1.15, p<0.001).
+
+Once considering all predictors together in a multivariate logit model, a one-year increase in education experience at exit is associated with higher odds of returning (OR=1.04, p<0.001). Controlling for all other predictors, the value of the odds ratios associated with pre-exit entry and education degree both increase relative to the univariate models for these variables.
+
+I am surprised that these few variables are as predictive of returning as they are, without any economic or educational context data included. The biggest data issues I raised in PEP remain, namely parsing dates. Downstream from the date parsing problem are multiple issues with complete time-order position histories within and across users, such as highly unrealistic education experience values and precise career stage identification. 

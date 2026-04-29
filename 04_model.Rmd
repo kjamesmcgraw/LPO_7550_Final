@@ -1,0 +1,294 @@
+---
+title: "04_model"
+author: "Kathryn James McGraw"
+date: "2026-04-28"
+output: html_document
+params:
+  recipe_file: "03_recipe_full.rmd"
+  recipe_object: "xgb_recipe"
+  suffix: "full"
+---
+
+```{r packages}
+# ACCRE environment
+# module load StdEnv/2023 StdEnvACCRE/2023 R/4.5.0
+
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(data.table)
+library(stringr)
+library(arrow)
+library(dplyr)
+library(vip)
+library(purrr)
+library(readr)
+library(recipes)
+library(xgboost)
+library(finetune)
+library(knitr)
+library(shiny)
+```
+
+```{r setup for variable-omitting recipe permutations}
+# Run selected recipe Rmd first
+recipe_script <- tempfile(fileext = ".R")
+knitr::purl(params$recipe_file, output = recipe_script, documentation = 0)
+source(recipe_script)
+
+# Standardize recipe name so rest of 04_model can stay mostly unchanged
+xgb_recipe <- get(params$recipe_object)
+
+# Suffix all outputs so files do not overwrite each other
+model_suffix <- params$suffix
+```
+
+
+### 3) Model selection + tuning plan
+- Define candidate model(s) and the final chosen model.
+- Use a consistent tuning/evaluation procedure (e.g., CV on training set).
+- Justify the choice of final model (performance + simplicity + interpretability + stability).
+
+```{r hyperparameters to tune}
+#setting model to tune mtry and depth
+xgb_spec <- boost_tree(
+  trees = 100, 
+  tree_depth   = tune(),   # controls tree complexity
+  min_n        = tune(),   # minimum observations per node
+  loss_reduction = tune(), # γ: minimum gain to accept a split - REGULARIZATION; if split doesn't provide sizable upgrade to fit, downgraded towards 0
+  sample_size  = tune(),   # row subsampling fraction (proportion of fold retained in tree)
+  mtry         = tune(),   # column subsampling per split (variables retained)
+  learn_rate   = tune()    # η: step size - how much error we're adding each time working within the residual - "help the model wander through the possible parameter space to not zero in too quickly on what is in the training set" to better handle incoming data. Hence XGB being a substantial improvement over RF.
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+```
+
+```{r workflow}
+#defining forest workflow
+xgb_wf <- workflow() %>%
+  add_recipe(xgb_recipe) %>% #robustness checks: xgb_recipe_nopostexit or xgb_recipe_noexityear
+  add_model(xgb_spec)
+
+#defining resamples
+df_rs <- vfold_cv(cal_train, v = 20)
+
+#set metrics
+hs_metrics<-metric_set(roc_auc)
+
+# define simulated annealing
+sim_anneal_control<-control_sim_anneal(cooling_coef=.02,  
+                                        verbose = FALSE,
+                                        save_history = FALSE)
+```
+
+```{r tune parameters}
+fit_model<- FALSE #don't need to retune hyperparameters for permutation
+
+if(fit_model){
+xgb_tune_fit <- xgb_wf %>%
+    tune_sim_anneal(df_rs,
+                    initial = 4,
+                    metrics=hs_metrics,
+                    control=sim_anneal_control)
+save(xgb_tune_fit, file = file.path(output_dir, "xgb_tune_fit_proj.Rdata"))
+} else{
+  load(file.path(output_dir, "xgb_tune_fit_proj.Rdata"))
+}
+```
+
+```{r check fit}
+autoplot(xgb_tune_fit)
+
+#inspecting fit
+xgb_tune_fit %>%
+  collect_metrics() %>%
+  group_by(min_n,mtry)%>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+
+show_best_tbl <- show_best(xgb_tune_fit, metric = "roc_auc", n = 10)
+write_csv(
+  show_best_tbl,
+  file.path(output_dir, "xgb_show_best_roc_auc.csv", model_suffix, ".csv"))
+) #save show_best output to csv (truncated in knit html)
+
+#finalize model with best parameters
+best_auc <- select_best(xgb_tune_fit,metric = "roc_auc")
+
+final_xgb <- finalize_model(
+  xgb_spec,
+  best_auc)
+
+best_auc
+```
+
+```{r final model}
+#defining workflow
+final_wf <- workflow() %>%
+  add_recipe(xgb_recipe) %>%
+  add_model(final_xgb)
+```
+
+### 4) Final evaluation and model quality checks
+Provide:
+- Final test-set performance with your primary metrics
+- Calibration check (especially for classification) if applicable
+- Robustness checks:
+  - Sensitivity to preprocessing choices
+  - Performance by key subgroups (if ethically and legally appropriate and variables are available)
+  - Error analysis on worst-performing segment(s)
+  
+```{r calibration check}
+# fit on cal_train for calibration
+cal_fit <- final_wf %>%
+  fit(data = cal_train)
+
+# Predict probabilities on the calibration set
+cal_preds <- augment(cal_fit, new_data=cal_test) %>%
+  mutate(
+    true_class_prob = if_else(
+      returner == "Returner",
+      .pred_Returner,
+      .pred_NotReturner
+    ),
+    score = 1 - true_class_prob
+  )
+
+# Nonconformity score: 1 - predicted probability of the *true* class
+cal_scores <- cal_preds %>%
+  mutate(
+    true_class_prob = if_else(returner == "Returner", .pred_Returner, .pred_NotReturner),
+    score           = 1 - true_class_prob
+  )
+
+cal_scores %>%
+  select(returner, .pred_Returner, .pred_NotReturner, score) %>%
+  head(10)
+```
+
+```{r calibration check quantile_threshold}
+alpha <- 0.10  # target: 90% coverage
+
+n <- nrow(cal_scores)
+
+# Finite-sample corrected quantile
+q_level <- ceiling((n + 1) * (1 - alpha)) / n
+q_level <- min(q_level, 1)  # cap at 1
+
+q_hat <- quantile(cal_scores$score, probs = q_level)
+
+cat("Calibration set size:", n, "\n")
+cat("Quantile level used:", round(q_level, 4), "\n")
+cat("Score threshold (q_hat):", round(q_hat, 4), "\n")
+```
+
+```{r calibration check score_distribution}
+ggplot(cal_scores, aes(x = score)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = q_hat, color = "firebrick", linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = q_hat + 0.02, y = Inf, vjust = 2,
+           label = paste0("q̂ = ", round(q_hat, 3)), color = "firebrick", size = 4) +
+  labs(
+    title    = "Distribution of calibration nonconformity scores",
+    subtitle = paste0("Scores above the dashed line exceed the ", round(1 - alpha, 2) * 100, "% threshold"),
+    x        = "Nonconformity score  (1 − predicted probability of true class)",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#checking on testing
+final_fit <- final_wf %>%
+  fit(data = train_cal)
+
+test_preds <- augment(final_fit, new_data = test)
+```
+
+```{r test conformal prediction intervals}
+test_preds <- test_preds %>%
+  mutate(
+    score_returner     = 1 - .pred_Returner,
+    score_not_returner = 1 - .pred_NotReturner,
+    pred_set = case_when(
+      score_returner <= q_hat & score_not_returner <= q_hat ~ "both",
+      score_returner <= q_hat ~ "Returner",
+      score_not_returner <= q_hat ~ "NotReturner",
+      TRUE ~ "empty"
+    )
+  )
+```
+
+```{r assess performance}
+#confusion matrix
+conf_mat(test_preds, truth = returner, estimate = .pred_class)
+
+#accuracy, precision, recall, etc.
+metric_set(accuracy, precision, recall, spec)(test_preds, truth = returner, estimate = .pred_class, event_level = "second")
+
+#roc_auc
+roc_auc(test_preds, truth = returner, .pred_Returner, event_level = "second")
+```
+  
+
+### 5) Interpretability and communication
+Include one or more:
+- Feature importance / coefficients
+- Example predictions (2–5 cases) with explanation
+- Model limitations: where it should *not* be used
+
+  
+```{r extract workflow}
+#extracting trained workflow for deployment
+saveRDS(final_fit, file.path(output_dir, paste0("xgb_final_workflow_", model_suffix, ".rds")))
+
+xgb_engine_fit <- final_fit %>%
+  extract_fit_parsnip() #saving for VIP plots below
+```
+
+```{r}
+vip(xgb_engine_fit, geom = "point") +
+  geom_point(color = "steelblue") +
+  labs(title = "XGBoost variable importance (Gain)") +
+  theme_minimal()
+```
+
+```{r}
+vip(xgb_engine_fit, geom = "point", type="cover") +
+  geom_point(color = "steelblue") +
+  labs(title = "XGBoost variable importance (Coverage)") +
+  theme_minimal()
+```
+
+```{r}
+vip(xgb_engine_fit, geom = "point", type="frequency") +
+  geom_point(color = "steelblue") +
+  labs(title = "XGBoost variable importance (Frequency)") +
+  theme_minimal()
+```
+
+```{r sample predictions}
+set.seed(2026)
+
+example_preds <- test_preds %>%
+  select(.row, returner, .pred_class, starts_with(".pred_")) %>%
+  slice_sample(n = 5)
+
+example_cases <- test %>%
+  mutate(.row = row_number()) %>%
+  inner_join(example_preds, by = c(".row", "returner")) #grabbing underlying features for those 5 cases
+
+write_csv(
+  example_preds,
+  file.path(output_dir, "xgb_test_example_predictions.csv", model_suffix, ".csv"))
+)
+```
