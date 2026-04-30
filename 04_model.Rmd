@@ -28,9 +28,12 @@ library(xgboost)
 library(finetune)
 library(knitr)
 library(shiny)
+library(ggplot2)
 ```
 
 ```{r setup for variable-omitting recipe permutations}
+options(knitr.duplicate.label = "allow")
+
 # Run selected recipe Rmd first
 recipe_script <- tempfile(fileext = ".R")
 knitr::purl(params$recipe_file, output = recipe_script, documentation = 0)
@@ -118,7 +121,7 @@ xgb_tune_fit %>%
 show_best_tbl <- show_best(xgb_tune_fit, metric = "roc_auc", n = 10)
 write_csv(
   show_best_tbl,
-  file.path(output_dir, "xgb_show_best_roc_auc.csv", model_suffix, ".csv"))
+  file.path(output_dir, paste0("xgb_show_best_roc_auc_", model_suffix, ".csv"))
 ) #save show_best output to csv (truncated in knit html)
 
 #finalize model with best parameters
@@ -189,6 +192,8 @@ q_hat <- quantile(cal_scores$score, probs = q_level)
 cat("Calibration set size:", n, "\n")
 cat("Quantile level used:", round(q_level, 4), "\n")
 cat("Score threshold (q_hat):", round(q_hat, 4), "\n")
+
+
 ```
 
 ```{r calibration check score_distribution}
@@ -215,7 +220,7 @@ test_preds <- augment(final_fit, new_data = test)
 ```
 
 ```{r test conformal prediction intervals}
-test_preds <- test_preds %>%
+test_conformal <- test_preds %>%
   mutate(
     score_returner     = 1 - .pred_Returner,
     score_not_returner = 1 - .pred_NotReturner,
@@ -226,11 +231,53 @@ test_preds <- test_preds %>%
       TRUE ~ "empty"
     )
   )
+
+efficiency <- test_conformal %>%
+  mutate(
+    set_size = case_when(
+      pred_set == "{0,1}" ~ 2,
+      pred_set %in% c("{0}", "{1}") ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  summarise(
+    avg_set_size = mean(set_size),
+    pct_singleton = mean(set_size == 1)
+  )
+
+efficiency
 ```
+
+```{r conformal preds heatmap}
+test_conformal %>%
+  count(returner, pred_set) %>%
+  ggplot(aes(x = pred_set, y = returner, fill = n)) +
+  geom_tile() +
+  geom_text(aes(label = n), color = "white") +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Conformal Prediction Set Distribution",
+    x = "Prediction Set",
+    y = "True Class"
+  ) +
+  theme_minimal()
+```
+
 
 ```{r assess performance}
 #confusion matrix
-conf_mat(test_preds, truth = returner, estimate = .pred_class)
+cm_table <- conf_mat(test_preds, truth = returner, estimate = .pred_class)
+cm_table
+
+# heat-coded confusion matrix figure
+cm_table %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = "Confusion Matrix",
+    x = "Predicted class",
+    y = "True class"
+  ) +
+  theme_minimal()
 
 #accuracy, precision, recall, etc.
 metric_set(accuracy, precision, recall, spec)(test_preds, truth = returner, estimate = .pred_class, event_level = "second")
@@ -238,7 +285,6 @@ metric_set(accuracy, precision, recall, spec)(test_preds, truth = returner, esti
 #roc_auc
 roc_auc(test_preds, truth = returner, .pred_Returner, event_level = "second")
 ```
-  
 
 ### 5) Interpretability and communication
 Include one or more:
@@ -280,6 +326,7 @@ vip(xgb_engine_fit, geom = "point", type="frequency") +
 set.seed(2026)
 
 example_preds <- test_preds %>%
+  mutate(.row = row_number()) %>%
   select(.row, returner, .pred_class, starts_with(".pred_")) %>%
   slice_sample(n = 5)
 
@@ -289,6 +336,6 @@ example_cases <- test %>%
 
 write_csv(
   example_preds,
-  file.path(output_dir, "xgb_test_example_predictions.csv", model_suffix, ".csv"))
+  file.path(output_dir, paste0("xgb_test_example_predictions_", model_suffix, ".csv"))
 )
 ```
